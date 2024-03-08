@@ -1,0 +1,780 @@
+echo "# masivscript" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/dedadink/masivscript.git
+git push -u origin main
+
+import datetime
+import logging
+import time
+import pytz
+import MetaTrader5 as mt5  # Assuming you're using the MetaTrader5 package
+import pandas as pd
+import numpy as np
+
+
+    
+class TradingBot:
+    def __init__(self, symbol, account_balance, risk_percent):
+        self.account_balance = account_balance
+        self.symbol = symbol
+        self.order_type = None
+        self.order_price = None
+        self.order_ticket = None
+        self.order_volume = None
+        self.remaining_volume = None
+        self.latest_bar_5m = None
+        self.latest_tick_price_ask = None
+        self.latest_tick_price_bid = None           
+        self.cumulative_profit_pips = 0
+        self.partial_closure_done = False
+        self.pip_conv = 0.0001  
+        self.check_counter = 0
+        self.risk_percent = 0.02
+        self.pip_scale = 1.00
+        self.magic_number = 88888
+        self.last_trade_result = None
+        self.current_time = None
+        self.trade_type = None
+        self.max_trades = 100
+        self.trade_count = 0
+        self.pip_value = None  # Initialize as None and set it after successful MT5 connection
+        self.timezone = pytz.timezone('Etc/GMT+2')
+        self.bin_size = 0.065
+        self.recalculate_levels = True  # Flag to indicate if levels need to be recalculated
+        self.lower_zone = None
+        self.upper_zone = None
+        self.stop_loss_price = 0
+        self.halfway_closure_executed = False
+        self.partial_closure_executed = False
+        self.can_open_new_trade = True
+        self.tp = None
+        self.profit_in_pips = 0
+        
+        #need to figureout still, they're not called on.
+
+        self.request = None
+        
+               
+    def initialize_mt5(self):
+        if not mt5.initialize():
+            print("initialize() failed")
+            mt5.shutdown()
+            return False
+        else:
+            print("Connected")
+            return True
+
+
+    # Setup logging
+    def setup_logging(self):
+        logger = logging.getLogger(__name__)
+        logging.basicConfig(format='%(message)s', level=logging.INFO)
+    
+    
+    def fetch_account_info(self):
+        account_info = mt5.account_info()
+        if account_info is None:
+            print("Failed to fetch account information.")
+            return None
+        return {
+            'balance': account_info.balance,
+        }
+    
+                
+    #start of methods to get the level (bollinger)
+    def fetch_data(self, symbol, timeframe, years):
+        
+        rates = mt5.copy_rates_range(
+            symbol,
+            timeframe,
+            pd.to_datetime(datetime.datetime.now(self.timezone).date()) - pd.DateOffset(years=years),
+            pd.to_datetime(datetime.datetime.now(self.timezone).date())
+        )
+        df = pd.DataFrame(rates)
+        print(df.columns)
+        return pd.DataFrame(rates)
+    
+    
+    # Used during trade management and get_level.
+    def update_latest_tick_price(self):
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            print("Error retrieving tick data:", mt5.last_error())
+            return None, None
+        else:
+            print(f"Latest tick data: {tick}")
+            self.latest_tick_price_bid = tick.bid
+            self.latest_tick_price_ask = tick.ask
+            return tick.bid, tick.ask
+            
+
+       
+    def define_ranges_and_bins(self):
+        # Update the latest tick prices
+        self.update_latest_tick_price()
+        
+        # Check if the latest tick prices are not None
+        if self.latest_tick_price_bid is None or self.latest_tick_price_ask is None:
+            print("Error: bid or ask price is None!")
+            return None, None, None
+        
+        # Define the ranges based on the latest tick prices
+        upper_range = self.latest_tick_price_ask + 0.20
+        lower_range = self.latest_tick_price_bid - 0.08
+        
+        # Return the calculated ranges and the bin size
+        return upper_range, lower_range, self.bin_size
+
+
+
+    def get_levels(self):
+        # Fetching the latest data for processing
+        df = self.fetch_and_concat_data(self.symbol)
+        
+        # Updating the latest tick prices
+        self.latest_tick_price_bid, self.latest_tick_price_ask = self.update_latest_tick_price()
+        
+        # Defining ranges using the updated prices
+        upper_range, lower_range, bin_size = self.define_ranges_and_bins()
+        
+        # Filtering the data based on the updated price ranges
+        upper_df, lower_df = self.filter_data_by_range(df, upper_range, lower_range)
+        
+        # Calculating the counts for the defined bins and getting the bins and indices
+        high_counts, low_counts, upper_bins, lower_bins, top_high_index, top_low_index = self.calculate_counts(upper_df, lower_df)
+        
+        # Identifying zones based on the counts and bins
+        upper_zone, lower_zone = self.identify_zones(high_counts, low_counts, upper_bins, lower_bins, top_high_index, top_low_index)
+        
+        # Assigning the identified zones to self for access outside this method
+        self.upper_zone = upper_zone
+        self.lower_zone = lower_zone
+        
+        # Returning the identified upper and lower zones
+        return upper_zone, lower_zone
+        
+            
+    
+    def calculate_counts(self, upper_df, lower_df):
+        upper_range, lower_range, _ = self.define_ranges_and_bins()
+        
+        upper_bins = np.arange(self.latest_tick_price_ask, upper_range, self.bin_size)
+        lower_bins = np.arange(lower_range, self.latest_tick_price_bid, self.bin_size)
+        
+        high_counts, _ = np.histogram(upper_df.values.flatten(), bins=upper_bins)
+        low_counts, _ = np.histogram(lower_df.values.flatten(), bins=lower_bins)
+        
+        top_high_index = high_counts.argmax()
+        top_low_index = low_counts.argmax()    
+        
+        return high_counts, low_counts, upper_bins, lower_bins, top_high_index, top_low_index
+    
+    
+    def get_symbol_info(self):
+        # Call this method after confirming MT5 connection
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info is None:
+            print(f"Failed to get symbol info for {self.symbol}")
+            return None
+        else:
+            self.pip_value = float(symbol_info.point)
+            return self.pip_value
+
+
+    def fetch_and_concat_data(self, symbol):
+        # Fetch and concatenate data
+        weekly_data = self.fetch_data(symbol, mt5.TIMEFRAME_W1, 10)
+        daily_data = self.fetch_data(symbol, mt5.TIMEFRAME_D1, 5)
+        hourly4_data = self.fetch_data(symbol, mt5.TIMEFRAME_H4, 1)
+        df = pd.concat([weekly_data, daily_data, hourly4_data], ignore_index=True)
+        return df
+
+
+    def filter_data_by_range(self, df, upper_range, lower_range):
+        # Filter data
+        upper_df = df[(df['high'] >= self.latest_tick_price_ask) & (df['high'] <= upper_range)]
+        lower_df = df[(df['low'] >= lower_range) & (df['low'] <= self.latest_tick_price_bid)]
+        upper_df = upper_df[['high', 'close']]
+        lower_df = lower_df[['low', 'close']]
+        return upper_df, lower_df
+  
+    def identify_zones(self, high_counts, low_counts, upper_bins, lower_bins, top_high_index, top_low_index):
+        if upper_bins is None or lower_bins is None:
+            print("Error: Bins are not defined!")
+            return None, None
+        
+        upper_zone = (upper_bins[top_high_index], upper_bins[top_high_index] + self.bin_size)
+        lower_zone = (lower_bins[top_low_index], lower_bins[top_low_index] + self.bin_size)
+        
+        return upper_zone, lower_zone
+    
+    
+    
+    # Used to check for entry against the set levels.
+    def update_latest_5m_bar(self):
+        print("Fetching latest 5-minute bar data...")
+        rates_5m = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 1)
+        if rates_5m is None:
+            print("Error retrieving 5-minute rates:", mt5.last_error())
+        else:        
+            self.latest_bar_5m = rates_5m[-1]
+            print(f"Latest 5-minute bar data: {self.latest_bar_5m}")  # Print the latest bar data
+
+
+    def wait_until_next_5min_mark(self):
+        # Calculate the time since the last 5-minute mark
+        self.current_time = datetime.datetime.now(self.timezone)
+        wait_time = (self.current_time.minute % 5) * 60 + self.current_time.second
+        if wait_time < 300:
+            print("Waiting until the next 5-minute mark...")
+            wait_time = 300 - wait_time  # 300 seconds = 5 minutes
+            print(f'Sleeping for {wait_time} seconds until the next 5-minute mark.')
+            time.sleep(wait_time)  # Sleep for the calculated wait time
+
+
+    def calculate_time_since_5min_mark(self):
+        # Calculate the time since the last 5-minute mark
+        self.current_time = datetime.datetime.now(self.timezone)
+        time_since_mark = (self.current_time.minute % 5) * 60 + self.current_time.second
+        return time_since_mark
+
+    def short_wait(self):
+        print("Short wait of 1 seconds...")
+        time.sleep(1)
+        
+    def long_wait_after_loss(self, last_trade_result):
+        if last_trade_result == 'loss':
+            print("Last trade was a loss in pips, waiting for 30 minutes...")
+            time.sleep(1800)
+                
+    def general_short_wait(self):
+        print("General short wait of 5 seconds...") 
+        time.sleep(5)
+
+    
+    def micro_wait(self):
+        print("Short wait of 0.10 seconds...")
+        time.sleep(0.10)  # Wait for 0.10 seconds
+        
+    def manage_wait_times(self):
+        time_since_mark = self.calculate_time_since_5min_mark()
+        if self.last_trade_result == 'loss':
+            self.long_wait_after_loss()
+        elif time_since_mark < 300:
+            self.wait_until_next_5min_mark(time_since_mark)
+        else:
+            self.general_short_wait()
+            
+        
+    def is_price_outside_levels(self, latest_bar_5m):
+        current_price = latest_bar_5m['close']
+        return current_price < self.lower_zone[0] or current_price > self.upper_zone[1]
+    
+        
+    def is_within_lower_zone(self, latest_bar_5m, lower_zone, tolerance=0.0005):
+        return lower_zone[0] - tolerance <= latest_bar_5m['close'] <= lower_zone[1] + tolerance
+
+    def is_within_upper_zone(self, latest_bar_5m, upper_zone, tolerance=0.0005):
+        return upper_zone[0] - tolerance <= latest_bar_5m['close'] <= upper_zone[1] + tolerance 
+
+    
+    def determine_trade_type(self, lower_cond, upper_cond):
+        if lower_cond:
+            return 'buy'
+        elif upper_cond:
+            return 'sell'
+        return None
+ 
+
+    def check_conditions_and_update_counter(self, latest_bar_5m, lower_zone, upper_zone):
+        lower_cond = self.is_within_lower_zone(latest_bar_5m, lower_zone)
+        upper_cond = self.is_within_upper_zone(latest_bar_5m, upper_zone)
+        print(f"Lower condition: {lower_cond}, Upper condition: {upper_cond}")
+        
+        # Initialize conditions_met as False
+        conditions_met = False
+        
+        # Check if current bar meets any of the conditions
+        if lower_cond or upper_cond:
+            # Increment the counter if a condition is met
+            self.check_counter += 1
+            print(f"Condition met in method, incrementing counter to {self.check_counter}.")
+            
+            # Check if this is the first condition met
+            if self.check_counter == 1:
+                print("First condition met, waiting for next bar to confirm...")
+            elif self.check_counter >= 2:
+                # Set conditions_met to True only if the counter is 2 or more
+                conditions_met = True
+                print("Second condition confirmed, proceeding with trade execution.")
+                # Reset the counter after confirming the second condition
+                self.check_counter = 0
+        else:
+            # Reset the counter if conditions are not met
+            if self.check_counter > 0:
+                print("Condition not met, resetting counter.")
+                self.check_counter = 0
+                
+        return conditions_met, lower_cond, upper_cond
+
+
+    def execute_trade(self):
+        # Fetch the latest tick data
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            print("Error retrieving tick data:", mt5.last_error())
+            return False  # Return False if there's an error fetching tick data
+        
+        print(f"Latest tick data: {tick}")
+        
+        print(f"Trade type: {self.trade_type}")
+        if self.trade_type == 'buy':
+            print("Attempting to execute BUY order...")
+            return self.execute_buy_order()  # Return the result of execute_buy_order
+        elif self.trade_type == 'sell':
+            print("Attempting to execute SELL order...")
+            return self.execute_sell_order()  # Return the result of execute_sell_order
+        else:
+            return False  # Return False if trade_type is not set
+
+        
+        
+
+    
+    
+    
+    def execute_buy_order(self):
+        
+        symbol = "GBPJPY.a"
+        price = mt5.symbol_info_tick(symbol).ask  # Use bid price for sell trade
+        point = mt5.symbol_info(symbol).point
+        lot = 1.0
+                
+        sl_price = self.lower_zone[0] - 20 * point  # Set SL level 100 points above the current bid price
+        tp_price = self.upper_zone[1] + 20 * point # Set TP level 100 points below the current bid price
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": mt5.ORDER_TYPE_BUY,
+            "price": price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "deviation": 20,
+            "magic": 88888,
+            "comment": "Buy order executed by script",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print("Buy order placed successfully!")
+            return True  # Return True if the order was successfully placed
+
+        else:
+            print(f"Buy order failed, error code: {result.retcode}")
+            return False  # Return False if the order failed
+
+
+
+    def execute_sell_order(self):
+        
+        symbol = "GBPJPY.a"
+        price = mt5.symbol_info_tick(symbol).bid  # Use bid price for sell trade
+        point = mt5.symbol_info(symbol).point
+        lot = 1.0
+    
+        sl_price = self.upper_zone[1] + 20 * point  # Set SL level 100 points above the current bid price
+        tp_price = self.lower_zone[0] - 20 * point  # Set TP level 100 points below the current bid price
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": mt5.ORDER_TYPE_SELL,
+            "price": price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "deviation": 20,
+            "magic": 88888,
+            "comment": "Buy order executed by script",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print("Sell order placed successfully!")
+            return True  # Return True if the order was successfully placed
+
+        else:
+            print(f"Buy order failed, error code: {result.retcode}")
+            return False  # Return False if the order failed
+            
+        
+        
+        
+     #TRADE MANAGEMENT NOW MODULATING AND DEBUGGING   
+        
+
+        
+     #when i have >0 trades and i need to check its status (trade management)
+    def update_position_info(self):
+        positions = mt5.positions_get(symbol=self.symbol)
+        if len(positions) > 0:
+            position = positions[0]
+            self.order_type = 'buy' if position.type == 0 else 'sell'
+            if self.order_type is None:
+                print("Error: order_type is not set.")
+                return  # Skip the current iteration or handle this case appropriately
+            self.order_price = position.price_open
+            self.order_ticket = position.ticket
+            self.order_volume = position.volume
+            self.remaining_volume = self.order_volume
+            self.stop_loss_price = position.sl
+            self.tp = position.tp
+            self.profit_in_pips = position.profit  # Update current profit from the position
+
+
+
+    #Prints out the remaining volume and the cumulative profit in pips.
+    def print_trade_summary(self, remaining_volume):
+        print(f"Remaining Volume final: {remaining_volume}")
+        print(f"Cumulative profit in pips: {self.cumulative_profit_pips}")
+
+    
+    def get_latest_tick_price_based_on_order_type(self, order_type):
+        if order_type == 'buy':
+            return self.latest_tick_price_ask
+        elif order_type == 'sell':
+            return self.latest_tick_price_bid
+        else:
+            print(f"Error: Invalid order type {order_type}.")
+            return None
+
+
+
+    #calls these methods in this specific order, ensuring that The final profit is calculated and Variables are reset for the next trade
+    def update_last_trade_result(self, remaining_volume, order_price, order_type):
+        self.update_latest_tick_price()  # Update the latest tick prices
+        latest_tick_price = self.get_latest_tick_price_based_on_order_type(order_type)
+        self.calculate_final_profit(remaining_volume, order_price, order_type, latest_tick_price)
+        self.print_trade_summary(remaining_volume)
+        self.handle_trade_outcome_and_wait()
+        self.reset_for_next_trade()
+
+        
+        
+    #if the last trade resulted in a loss or gain, updates the last_trade_result attribute, and waits for a specific time before proceeding    
+    def handle_trade_outcome_and_wait(self):
+        if self.cumulative_profit_pips < 0:
+            self.last_trade_result = "loss"
+            print("Last trade was a loss in pips, waiting for 30 minutes...")
+            time.sleep(1800)
+        else:
+            self.last_trade_result = "gain"
+            print("Last trade was a gain in pips, proceeding...")
+        time.sleep(5)
+
+    #Resets variables like cumulative_profit_pips and partial_closure_done to prepare for the next trade.
+    def reset_for_next_trade(self):
+        self.cumulative_profit_pips = 0
+        self.partial_closure_done = False
+        
+    # expected to be used after update_latest_tick_price or update_last_trade_result so no need for another tick update; Used to determine if the past trade is a loss, which in turn will wait 30 minutes (updates the cumulative_profit_pips attribute) 
+    def calculate_final_profit(self, remaining_volume, order_price, order_type):
+        latest_tick_price = self.get_latest_tick_price_based_on_order_type(order_type)
+        if remaining_volume == 0:
+            final_profit_pips = (latest_tick_price - order_price) * self.pip_conv if order_type == 'buy' else (order_price - latest_tick_price) * self.pip_conv
+            self.cumulative_profit_pips += final_profit_pips
+    
+            
+    def handle_partial_closure(self, percentage, price, magic_number, order_ticket, order_type, order_price, order_volume, remaining_volume, pip_conv):
+        close_volume = remaining_volume * percentage
+        result = close_partial_position(order_ticket, close_volume, price, self.symbol, magic_number)  # Assuming close_partial_position is another method
+        if result:
+            print(f"{percentage * 100}% of the position closed successfully at price {price}!")
+            partial_profit_pips = (price - order_price) * pip_conv * close_volume if order_type == 'buy' else (order_price - price) * pip_conv * close_volume
+            self.cumulative_profit_pips += partial_profit_pips 
+            remaining_volume -= close_volume
+        else:
+            print(f"Failed to close {percentage * 100}% of the position")
+
+        # Move Stop Loss to break-even
+        if percentage == 0.3:  # Replace with your condition
+            new_sl = self.order_price + 3 * self.pip_value if self.trade_type == 'buy' else self.order_price - 3 * self.pip_value
+            self.move_sl_to(new_sl, order_ticket, position)   
+            
+
+    def move_sl_to(self, new_sl, order_ticket):  
+        new_sl = self.order_price if self.trade_type == 'buy' else self.order_price #i've changed this logic as whenever i'm changing SL it will be when i'm in a profit, so if i simply move my SL to break even then that will be my strategy.
+        symbol = "GBPJPY.a"
+        lot = 1.0
+        
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "sl": new_sl,
+            "tp": self.tp,  
+            "magic": 88888,
+            "deviation": 30,
+            "position": order_ticket,
+            "comment": "move SL",
+        }
+        
+        result = mt5.order_send(request)
+        
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"Stop loss moved to {new_sl} successfully!")
+            return True
+        else:
+            print("Failed to move stop loss, error code:", result.retcode)
+            return False
+    
+    
+    
+    
+    
+
+        
+           
+        
+    def close_partial_position(self, order_ticket, close_volume):
+        # Ensure there's volume to close
+        if close_volume > 0:
+            symbol = "GBPJPY.a"
+            point = mt5.symbol_info(symbol).point
+            lot = 1.0
+            
+            # Determine the price based on trade type
+            price = self.latest_tick_price_ask if self.trade_type == 'buy' else self.latest_tick_price_bid
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": close_volume,  # Use the calculated close_volume
+                "type": mt5.ORDER_TYPE_SELL if self.trade_type == 'buy' else mt5.ORDER_TYPE_BUY,
+                "price": price,
+                "deviation": 30,
+                "magic": 88888,
+                "comment": "Partial close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print("Partial position closed successfully!")
+                return True
+                partial_closed = self.close_partial_position(order_ticket, close_volume)
+                if partial_closed:
+                    # If partial position closed successfully, then move SL
+                    new_sl = self.calculate_new_sl()  # You need to define how you calculate the new SL
+                    sl_moved = self.move_sl_to(new_sl, order_ticket)
+                    if sl_moved:
+                        print("Stop loss moved successfully after partial closure.")
+                        return True
+                    else:
+                        print("Failed to move stop loss after partial closure.")
+                        return False
+                else:
+                    print("Partial position closure failed.")
+                    return False
+            else:
+                print("No volume to close for partial position.")
+                return False
+        else:
+            # If there's no volume to close, log and return False
+            print("No volume to close for halfway position.")
+            return False
+        
+            
+    def close_halfway_position(self, order_ticket, close_volume):
+        # Ensure there's volume to close
+        if close_volume > 0:
+            symbol = "GBPJPY.a"
+            point = mt5.symbol_info(symbol).point
+            lot = 1.0
+            
+            # Determine the price based on trade type
+            price = self.latest_tick_price_ask if self.trade_type == 'buy' else self.latest_tick_price_bid
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": close_volume,  # Use the calculated close_volume
+                "type": mt5.ORDER_TYPE_SELL if self.trade_type == 'buy' else mt5.ORDER_TYPE_BUY,
+                "price": price,
+                "deviation": 30,
+                "magic": 88888,
+                "comment": "Partial close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print("Partial position closed successfully!")
+                return True
+            else:
+                print(f"Partial close failed, error code: {result.retcode}")
+                return False
+        else:
+            # If there's no volume to close, log and return False
+            print("No volume to close for halfway position.")
+            return False
+        
+        
+        
+
+        
+        
+    def calculate_lot_size(self):
+        return (self.account_balance * self.risk_percent) / 1000
+
+    
+    
+    
+    
+    
+        #so i still need to   
+    def trade_management(self):
+        self.update_position_info()
+        latest_tick_price = self.get_latest_tick_price_based_on_order_type(self.order_type)
+        
+        
+        # Determine volumes to close based on conditions
+        partial_close_volume = self.manage_partial_closures(self.profit_in_pips, self.order_volume)
+        halfway_close_volume = self.manage_halfway_closure(self.order_price, self.stop_loss_price, self.order_volume)
+        
+        # Execute partial close if needed
+        if partial_close_volume > 0:
+            self.close_partial_position(self.order_ticket, partial_close_volume)
+            
+        # Execute halfway close if needed
+        if halfway_close_volume > 0:
+            self.close_halfway_position(self.order_ticket, halfway_close_volume)
+            
+        
+    
+    def manage_halfway_closure(self, order_price, stop_loss_price, order_volume):
+        close_volume = 0  
+        halfway_point = self.half_way_to_stop_loss(order_price, stop_loss_price)
+        if self.latest_tick_price >= halfway_point:
+            close_volume = order_volume * 0.5  # Close 50% of the position
+        return close_volume  # Return the calculated close_volum
+        
+    def manage_partial_closures(self, profit_in_pips, order_volume):
+        close_volume = 0  # Initialize close_volume
+        if profit_in_pips >= 100:  # Assuming 10 is your profit threshold
+            close_volume = order_volume * 0.5  # Close 50% of the position
+        return close_volume  # Return the calculated close_volume
+
+
+
+    def half_way_to_stop_loss(self, order_price, stop_loss_price):
+        return order_price + (stop_loss_price - order_price) * 0.5
+
+
+
+    
+    
+    
+    def decide_final_close_volume(self, close_volume_profit_time, close_volume_halfway):
+        if self.meets_halfway_closure_condition():
+            return self.calculate_halfway_close_volume()
+        elif self.meets_partial_closure_condition():
+            
+            return self.calculate_partial_close_volume()
+        else:
+            return 0  # No closure        return max(close_volume_profit_time, close_volume_halfway)
+        
+        
+        def on_trade_close(self):
+            self.cumulative_profit_pips = 0  
+
+        
+    
+def main():
+    bot = TradingBot('GBPJPY', 100000, 0.01)
+    if bot.initialize_mt5():
+        bot.setup_logging()
+        bot.pip_value = bot.get_symbol_info()  # Fetch symbol info after successful connection
+        if bot.pip_value is not None:
+            try:
+                while True:
+                    account_info = bot.fetch_account_info()
+                    if account_info is not None:
+                        if bot.trade_count >= bot.max_trades:
+                            print(f"Maximum number of trades ({bot.max_trades}) reached. Stopping the bot.")
+                            break 
+
+                            
+                        positions = mt5.positions_get(symbol="GBPJPY.a")
+                        if len(positions) > 0:
+                            bot.update_position_info()  # Make sure this updates all necessary info from the position
+                            bot.trade_management()
+                            bot.can_open_new_trade = False  # Prevent new trades while managing existing ones
+                            continue  # Skip the rest of the loop if managing an open position
+                        else:
+                            bot.can_open_new_trade = True  # Allow new trades if no open positions
+    
+    
+                                      
+                    bot.current_time = datetime.datetime.now(bot.timezone)
+                    time_since_mark = bot.calculate_time_since_5min_mark()
+
+                    if bot.recalculate_levels:
+                        bot.get_levels()
+                        print(f"Calculated Bollinger Band Levels: Lower Zone={bot.lower_zone}, Upper Zone={bot.upper_zone}")
+                        bot.recalculate_levels = False
+                        bot.micro_wait()
+
+                    bot.update_latest_5m_bar() 
+                    if bot.is_price_outside_levels(bot.latest_bar_5m):
+                        bot.recalculate_levels = True 
+                        bot.micro_wait()
+                
+                
+                        
+                    if bot.can_open_new_trade:
+                        print(f"checking conditions in loop")  
+                        conditions_met, lower_cond, upper_cond = bot.check_conditions_and_update_counter(bot.latest_bar_5m, bot.lower_zone, bot.upper_zone)
+                        if conditions_met:
+                            print(f"Conditions met: {conditions_met}")
+                            bot.trade_type = bot.determine_trade_type(lower_cond, upper_cond)
+                            print(f"attempting trade execution") 
+                            bot.short_wait()
+                            trade_executed = bot.execute_trade() 
+                            if trade_executed:
+                                bot.trade_count += 1
+                                print(f"Trade executed. Total trades: {bot.trade_count}")
+                                bot.trade_type = None 
+                                bot.can_open_new_trade = False  # Prevent new trades after execution.
+                            else:
+                                print("Trade execution failed.")
+                        else:
+                            print("Conditions not met for trade entry.")
+                        bot.general_short_wait()
+
+                    if bot.can_open_new_trade and time_since_mark < 300:
+                        bot.wait_until_next_5min_mark()
+                        continue  # Skip the rest of the loop if it's not time yet
+
+                    bot.short_wait()
+
+                        
+                    
+            except Exception as e:
+                print(f"An error occurred: {e}")
+            finally:
+                print("Cleaning up resources")
+                mt5.shutdown()
+        else:
+            print("Failed to fetch symbol info. Please check your symbol and connection.")
+    else:
+        print("Failed to initialize MT5. Please check your connection or settings.")
+
+if __name__ == "__main__":
+    main()
